@@ -1,0 +1,1678 @@
+// ==UserScript==
+// @name         G+ (Hide Buttons + Anonymous Stories + Downloader)
+// @namespace    https://example.local/g-plus
+// @version      6.1.0
+// @description  Per-site options: hide hearts/likes/reposts/comments/shares/bookmarks/reactions (with counts). Anonymous story viewing, story downloader (IG/FB), TikTok video downloader, X photo/video downloader. Files: username-date-platform.
+// @match        https://*.facebook.com/*
+// @match        https://*.instagram.com/*
+// @match        https://*.tiktok.com/*
+// @match        https://x.com/*
+// @match        https://twitter.com/*
+// @run-at       document-start
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// @grant        GM_download
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @connect      cdninstagram.com
+// @connect      instagram.com
+// @connect      fbcdn.net
+// @connect      facebook.com
+// @connect      tiktok.com
+// @connect      tiktokcdn.com
+// @connect      tiktokcdn-us.com
+// @connect      tiktokcdn-eu.com
+// @connect      tiktokv.com
+// @connect      tiktokv.us
+// @connect      tiktokw.us
+// @connect      byteoversea.com
+// @connect      ibytedtos.com
+// @connect      ibyteimg.com
+// @connect      muscdn.com
+// @connect      twimg.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const W = unsafeWindow;
+  const host = location.hostname;
+  const PLATFORM =
+    host.includes('instagram') ? 'instagram' :
+    host.includes('facebook')  ? 'facebook'  :
+    host.includes('tiktok')    ? 'tiktok'    :
+    (host === 'x.com' || host.includes('twitter')) ? 'x' : 'unknown';
+
+  const HAS_STORIES = PLATFORM === 'instagram' || PLATFORM === 'facebook';
+  const HAS_HOOKS = HAS_STORIES || PLATFORM === 'tiktok' || PLATFORM === 'x';
+
+  /* ------------------------------------------------------------------ *
+   * Options per site
+   * ------------------------------------------------------------------ */
+  const OPTIONS = {
+    instagram: [
+      { section: 'Hide' },
+      { key: 'hearts',   label: 'Hearts' },
+      { key: 'reposts',  label: 'Reposts' },
+      { key: 'comments', label: 'Comments' },
+      { key: 'sends',    label: 'Send' },
+      { key: 'saves',    label: 'Bookmark' },
+      { section: 'Stories' },
+      { key: 'anon',     label: 'Anonymous view' },
+      { key: 'download', label: 'Download' },
+      { section: 'Posts' },
+      { key: 'postdl',   label: 'Download' },
+    ],
+    x: [
+      { section: 'Hide' },
+      { key: 'reposts',  label: 'Reposts' },
+      { key: 'hearts',   label: 'Likes' },
+      { key: 'comments', label: 'Comments' },
+      { key: 'saves',    label: 'Bookmark' },
+      { section: 'Posts' },
+      { key: 'download', label: 'Download' },
+    ],
+    tiktok: [
+      { section: 'Hide' },
+      { key: 'likes',    label: 'Likes' },
+      { key: 'comments', label: 'Comments' },
+      { key: 'saves',    label: 'Bookmark' },
+      { key: 'shares',   label: 'Share' },
+      { section: 'Videos' },
+      { key: 'download', label: 'Download' },
+    ],
+    facebook: [
+      { section: 'Hide' },
+      { key: 'likes',     label: 'Likes' },
+      { key: 'comments',  label: 'Comments' },
+      { key: 'shares',    label: 'Share' },
+      { key: 'reactions', label: 'Reactions' },
+      { section: 'Stories' },
+      { key: 'anon',      label: 'Anonymous view' },
+      { key: 'download',  label: 'Download' },
+    ],
+  };
+
+  const DEFAULTS = { anon: true, download: true, custom: true, postdl: true };
+  const STORE_KEY = 'cfg_' + PLATFORM;
+  const cfg = Object.assign({}, DEFAULTS, GM_getValue(STORE_KEY, {}));
+  const saveCfg = () => GM_setValue(STORE_KEY, cfg);
+  let customRules = GM_getValue('custom_' + PLATFORM, []);
+
+  const normText = (t) => String(t || '').replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
+
+  /* ------------------------------------------------------------------ *
+   * 1) HIDE ENGINE (inline styles -> works under strict page CSP)
+   *    Rule fields:
+   *      sel   CSS selector            up    closest ancestor to hide
+   *      text  regex on element text   norm  normalise text first
+   *      leaf  no child elements       fit   also hide parents with same text
+   *      climb hide the bar item that contains this element but not <climb>
+   *      solo  also hide parents that wrap only this element
+   *      count also hide a numeric sibling (the counter next to a button)
+   * ------------------------------------------------------------------ */
+  const BTN = '[role="button"]';
+  const IG_SEND = 'svg[aria-label="Share"], svg[aria-label="Share Post"], svg[aria-label="Send"], svg[aria-label="Send post"], svg[aria-label="Direct"]';
+  const TT_L = '[data-e2e="like-icon"], [data-e2e="browse-like-icon"]';
+  const TT_C = '[data-e2e="comment-icon"], [data-e2e="browse-comment-icon"]';
+  const TT_S = '[data-e2e="share-icon"], [data-e2e="browse-share-icon"]';
+  const TT_SAVE = '[data-e2e="undefined-icon"], [data-e2e="bookmark-icon"], [data-e2e="collect-icon"], [data-e2e="browse-collect-icon"], [data-e2e="browse-bookmark-icon"], [data-e2e="browse-undefined-icon"]';
+  const TT_SAVE_LABEL = '[aria-label*="avorite" i], [aria-label*="ookmark" i], [aria-label*="collect" i], [aria-label^="Save" i]';
+
+  const RULES = {
+    instagram: {
+      hearts: [
+        { sel: 'svg[aria-label="Like"], svg[aria-label="Unlike"]', ig: true },
+        { sel: 'a[href*="/liked_by/"]', likeLine: true },
+      ],
+      reposts: [
+        { sel: 'svg[aria-label="Repost"]', ig: true },
+      ],
+      comments: [
+        { sel: 'svg[aria-label="Comment"]', ig: true },
+        { sel: 'a, span', text: /^View (all )?[\d.,]+[KMkm]? comments?$/, leaf: true, fit: true },
+        { sel: 'textarea[aria-label^="Add a comment"]', up: 'form' },
+      ],
+      sends: [
+        { sel: IG_SEND, ig: true },
+      ],
+      saves: [
+        { sel: 'svg[aria-label="Save"], svg[aria-label="Remove"]', ig: true },
+      ],
+    },
+    x: {
+      reposts:  [{ sel: '[data-testid="retweet"], [data-testid="unretweet"]', solo: true }],
+      hearts:   [{ sel: '[data-testid="like"], [data-testid="unlike"]', solo: true }],
+      comments: [{ sel: '[data-testid="reply"]', solo: true }],
+      saves:    [{ sel: '[data-testid="bookmark"], [data-testid="removeBookmark"]', solo: true }],
+    },
+    tiktok: {
+      likes: [
+        { sel: TT_L, climb: TT_C },
+        { sel: '[data-e2e="like-count"], [data-e2e="browse-like-count"]' },
+      ],
+      comments: [
+        { sel: TT_C, climb: TT_L },
+        { sel: '[data-e2e="comment-count"], [data-e2e="browse-comment-count"]' },
+      ],
+      saves: [
+        { sel: TT_SAVE, climb: TT_C },
+        { sel: TT_SAVE_LABEL, climb: TT_C },
+        { sel: '[data-e2e="undefined-count"], [data-e2e="bookmark-count"], [data-e2e="collect-count"]' },
+      ],
+      shares: [
+        { sel: TT_S, climb: TT_C },
+        { sel: '[data-e2e="share-count"], [data-e2e="browse-share-count"]' },
+      ],
+    },
+    facebook: {
+      shares: [
+        { sel: '[data-ad-rendering-role="share_button"]' },
+        { sel: '[aria-label="Share" i], [aria-label^="Send this to friends" i], [aria-label^="Share this" i], [aria-label="Share post" i], [aria-label*="share" i][role="button"]', up: BTN },
+        { sel: '[role="button"], div[tabindex="0"], span[tabindex="0"], a[role="link"]', text: /^share$/i, norm: true },
+        { sel: 'span, div', text: /^\d[\d.,]*[KM]? shares?$/i, leaf: true },
+      ],
+      comments: [
+        { sel: '[data-ad-rendering-role="comment_button"]' },
+        { sel: '[aria-label="Leave a comment" i], [aria-label="Comment" i]', up: BTN },
+        { sel: '[role="button"], div[tabindex="0"]', text: /^comment$/i, norm: true },
+        { sel: 'span, div', text: /^\d[\d.,]*[KM]? comments?$/i, leaf: true },
+      ],
+      likes: [
+        { sel: '[data-ad-rendering-role="like_button"]' },
+        { sel: '[aria-label="Like" i], [aria-label="Remove Like" i]', up: BTN },
+        { sel: '[role="button"], div[tabindex="0"]', text: /^like$/i, norm: true },
+      ],
+      reactions: [
+        { sel: '[aria-label^="See who reacted"], [aria-label*="reactions"], [role="toolbar"][aria-label="Reactions"]' },
+      ],
+    },
+  };
+
+  const marked = new Map();       // element -> Set(keys)
+  const hiddenNow = new WeakSet();
+
+  function mark(el, key) {
+    let s = marked.get(el);
+    if (!s) { s = new Set(); marked.set(el, s); }
+    s.add(key);
+  }
+  function fitUp(el) {
+    const txt = el.textContent.trim();
+    let t = el;
+    for (let i = 0; i < 3; i++) {
+      const p = t.parentElement;
+      if (!p || p === document.body || p.textContent.trim() !== txt) break;
+      t = p;
+    }
+    return t;
+  }
+  function soloUp(el) {
+    let t = el;
+    for (let i = 0; i < 3; i++) {
+      const p = t.parentElement;
+      if (!p || p.childElementCount !== 1 || p.getAttribute('role') === 'group' || p === document.body) break;
+      t = p;
+    }
+    return t;
+  }
+  function climbTo(el, sibSel) {
+    let t = el;
+    for (let i = 0; i < 10; i++) {
+      const p = t.parentElement;
+      if (!p) return null;
+      if (p.querySelector(sibSel)) return t;
+      t = p;
+    }
+    return null;
+  }
+  const NUM_RE = /^[\d.,]+\s*[KMBkmb]?$/;
+  function hideCountNear(t, key) {
+    // the counter is a plain-number sibling of the button (or of the button's wrapper)
+    let c = t;
+    for (let lvl = 0; lvl < 2 && c; lvl++, c = c.parentElement) {
+      const sib = c.nextElementSibling;
+      if (sib && !sib.querySelector('svg, [role="button"], button, a, img, textarea, input') && NUM_RE.test(sib.textContent.trim())) {
+        mark(sib, key);
+        return;
+      }
+    }
+  }
+
+  function textNoSvg(el) {
+    const c = el.cloneNode(true);
+    c.querySelectorAll('svg').forEach(x => x.remove());
+    return c.textContent || '';
+  }
+  const IG_ACTIONS = new Set(['Like', 'Unlike', 'Comment', 'Repost', 'Share', 'Share Post', 'Send', 'Send post', 'Direct', 'Save', 'Remove']);
+  function igActionCount(el) {
+    let n = 0;
+    el.querySelectorAll('svg[aria-label]').forEach(x => { if (IG_ACTIONS.has(x.getAttribute('aria-label'))) n++; });
+    n += el.querySelectorAll('.stk-igdl').length;
+    return n;
+  }
+  // the whole action slot (button + its counter) that belongs to ONE icon
+  function igItemOf(svg) {
+    let t = svg.closest(BTN) || svg;
+    for (let i = 0; i < 4; i++) {
+      const p = t.parentElement;
+      if (!p || p === document.body || p.tagName === 'ARTICLE' || p.tagName === 'SECTION') break;
+      if (p.getElementsByTagName('*').length > 60) break;
+      if (igActionCount(p) > 1) break;
+      const txt = textNoSvg(p).trim();
+      if (txt !== '' && !NUM_RE.test(txt)) break;
+      t = p;
+    }
+    return t;
+  }
+  // "Liked by x and others"  /  "1,234 likes"
+  function likeLineOf(a) {
+    const re = /^(Liked by|[\d.,]+\s*[KMBkmb]?\s+likes?)/i;
+    let t = a;
+    for (let i = 0; i < 6 && t && t !== document.body; i++) {
+      if (re.test(textNoSvg(t).trim())) return t;
+      t = t.parentElement;
+    }
+    return a;
+  }
+
+  function scan() {
+    const rules = RULES[PLATFORM] || {};
+    for (const key in rules) {
+      for (const r of rules[key]) {
+        let list;
+        try { list = document.querySelectorAll(r.sel); } catch (e) { continue; }
+        list.forEach((el) => {
+          if (el.closest && el.closest('.stk-ttdl, .stk-xdl, .stk-igdl, #stk-root')) return;
+          if (r.leaf && el.childElementCount) return;
+          if (r.text) {
+            if (el.childElementCount > 8) return;
+            const raw = el.textContent;
+            if (raw.length > 40) return;
+            const tx = r.norm ? normText(raw) : raw.trim();
+            if (!r.text.test(tx)) return;
+          }
+          let t;
+          if (r.ig) t = igItemOf(el);
+          else if (r.likeLine) t = likeLineOf(el);
+          else if (r.climb) t = climbTo(el, r.climb) || el.closest('button') || el;
+          else if (r.up) t = el.closest(r.up) || el;
+          else t = el;
+          if (r.solo) t = soloUp(t);
+          if (r.fit) t = fitUp(t);
+          mark(t, key);
+          if (r.count || r.ig) hideCountNear(t, key);
+        });
+      }
+    }
+    // TikTok: if the bookmark item has no recognisable markup, it is the slot right after "comment"
+    if (PLATFORM === 'tiktok') {
+      document.querySelectorAll(TT_C).forEach((ci) => {
+        const item = climbTo(ci, TT_L);
+        if (!item) return;
+        const bar = item.parentElement;
+        if (!bar || bar.querySelector(TT_SAVE) || bar.querySelector(TT_SAVE_LABEL)) return;
+        const next = item.nextElementSibling;
+        if (next && !next.classList.contains('stk-ttdl') && !next.querySelector(TT_S) && !next.querySelector(TT_L)) mark(next, 'saves');
+      });
+    }
+    // user-picked elements
+    customRules.forEach((r) => {
+      let list;
+      try { list = document.querySelectorAll(r.sel); } catch (e) { return; }
+      list.forEach((el) => {
+        if (r.text && normText(el.textContent) !== r.text) return;
+        mark(el, 'custom');
+      });
+    });
+  }
+  function apply() {
+    marked.forEach((keys, el) => {
+      if (!el.isConnected) { marked.delete(el); return; }
+      const hide = [...keys].some(k => cfg[k]);
+      if (hide) { el.style.setProperty('display', 'none', 'important'); hiddenNow.add(el); }
+      else if (hiddenNow.has(el)) { el.style.removeProperty('display'); hiddenNow.delete(el); }
+    });
+  }
+
+  let timer = null;
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      try { scan(); apply(); ensureTikTokButtons(); ensureXButtons(); ensureIGPostButtons(); } catch (e) {}
+    }, 250);
+  }
+  try {
+    new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+
+  /* ------------------------------------------------------------------ *
+   * 2) NETWORK HOOKS: anonymous stories + media capture
+   * ------------------------------------------------------------------ */
+  const SEEN_RE = new RegExp([
+    '\\/stories\\/reel\\/seen',
+    'PolarisStoriesV\\d+SeenMutation',
+    'StoriesV\\d+Seen',
+    'storiesUpdateSeenState',
+    'StoriesUpdateSeen',
+    'StoryViewerSeen',
+    'storyBucketSeen',
+    'reel_?seen',
+  ].join('|'), 'i');
+
+  const igStories = {};   // pk -> {pk, username, takenAt, url, isVideo}
+  const igByUser = {};    // username -> [pk]
+  const igPosts = {};     // shortcode -> {code, username, takenAt, items:[{url, ext}]}
+  const igUserIds = {};   // username -> numeric user id
+  const fbDocs = [];      // parsed facebook JSON payloads
+  const ttItems = {};     // video id -> {...}
+  const xTweets = {};     // tweet id -> {id, user, time, media:[{url, ext}]}
+
+  const nativeFetch = W.fetch ? W.fetch.bind(W) : null;
+
+  function shouldBlock(url, body) {
+    if (!HAS_STORIES || !cfg.anon) return false;
+    return SEEN_RE.test(url) || (body && SEEN_RE.test(body));
+  }
+  function bodyToText(body) {
+    try {
+      if (!body) return '';
+      if (typeof body === 'string') return body;
+      if (body instanceof URLSearchParams) return body.toString();
+      if (body.constructor && body.constructor.name === 'FormData') {
+        return [...body.entries()].map(([k, v]) => `${k}=${typeof v === 'string' ? v : ''}`).join('&');
+      }
+    } catch (e) {}
+    return '';
+  }
+  function parseLoose(text) {
+    text = String(text).replace(/^for \(;;\);/, '');
+    try { return [JSON.parse(text)]; } catch (e) {}
+    const out = [];
+    text.split('\n').forEach(line => { try { out.push(JSON.parse(line)); } catch (e) {} });
+    return out;
+  }
+  const area = (o) => (o && o.width && o.height) ? o.width * o.height : 0;
+  const pathOf = (u) => { try { return new URL(u).pathname; } catch (e) { return String(u).split('?')[0]; } };
+
+  /* ---- Instagram ---- */
+  function igBest(o) {
+    const vids = (o.video_versions || []).slice().sort((a, b) => area(b) - area(a) || (b.bandwidth || 0) - (a.bandwidth || 0));
+    const imgs = ((o.image_versions2 && o.image_versions2.candidates) || []).slice().sort((a, b) => area(b) - area(a));
+    const url = (vids[0] && vids[0].url) || (imgs[0] && imgs[0].url);
+    return url ? { url, isVideo: !!vids[0], ext: vids[0] ? 'mp4' : 'jpg' } : null;
+  }
+  function walkIG(o, ctxUser, depth) {
+    if (!o || typeof o !== 'object' || depth > 40) return;
+    const user = (o.user && o.user.username) || (o.owner && o.owner.username) || ctxUser;
+    if (typeof o.username === 'string' && (o.pk || o.pk_id)) igUserIds[o.username] = String(o.pk || o.pk_id);
+    if (o.video_versions || o.image_versions2) {
+      const pk = String(o.pk || o.id || '').split('_')[0];
+      const b = igBest(o);
+      if (pk && b) {
+        igStories[pk] = { pk, username: user || 'unknown', takenAt: o.taken_at, url: b.url, isVideo: b.isVideo };
+        if (user) {
+          (igByUser[user] = igByUser[user] || []);
+          if (!igByUser[user].includes(pk)) igByUser[user].push(pk);
+        }
+      }
+    }
+    if (typeof o.code === 'string' && (o.carousel_media || o.video_versions || o.image_versions2)) {
+      const kids = (o.carousel_media && o.carousel_media.length) ? o.carousel_media : [o];
+      const items = kids.map(k => igBest(k)).filter(Boolean);
+      if (items.length) igPosts[o.code] = { code: o.code, username: user || 'unknown', takenAt: o.taken_at, items };
+    }
+    for (const k in o) walkIG(o[k], user, depth + 1);
+  }
+
+  /* ---- TikTok ---- */
+  function bestTikTokUrl(v) {
+    const cands = [];
+    (v.bitrateInfo || []).forEach(b => {
+      const urls = (b.PlayAddr && b.PlayAddr.UrlList) || [];
+      if (urls.length) cands.push({ url: urls[0], br: b.Bitrate || 0, h264: /h264/i.test(b.CodecType || b.GearName || '') });
+    });
+    const h264 = cands.filter(c => c.h264);
+    const pool = h264.length ? h264 : cands;
+    pool.sort((a, b) => b.br - a.br);
+    if (pool[0]) return pool[0].url;
+    if (typeof v.playAddr === 'string' && v.playAddr) return v.playAddr;
+    if (typeof v.downloadAddr === 'string' && v.downloadAddr) return v.downloadAddr;
+    return null;
+  }
+  function ttPaths(v) {
+    const out = [];
+    (v.bitrateInfo || []).forEach(b => ((b.PlayAddr && b.PlayAddr.UrlList) || []).forEach(u => out.push(pathOf(u))));
+    [v.playAddr, v.downloadAddr].forEach(u => { if (typeof u === 'string' && u) out.push(pathOf(u)); });
+    return out;
+  }
+  function walkTT(o, depth) {
+    if (!o || typeof o !== 'object' || depth > 40) return;
+    if (o.id && o.video && (o.video.bitrateInfo || o.video.playAddr || o.video.downloadAddr)) {
+      const url = bestTikTokUrl(o.video);
+      if (url) {
+        const author = typeof o.author === 'string' ? o.author : (o.author && (o.author.uniqueId || o.author.unique_id));
+        ttItems[String(o.id)] = {
+          id: String(o.id), user: author || 'unknown', createTime: Number(o.createTime) || null, url, base: ttPaths(o.video),
+        };
+      }
+    }
+    for (const k in o) walkTT(o[k], depth + 1);
+  }
+
+  /* ---- X ---- */
+  function xMediaList(media) {
+    const out = [];
+    (media || []).forEach((m) => {
+      if (!m) return;
+      if ((m.type === 'video' || m.type === 'animated_gif') && m.video_info && m.video_info.variants) {
+        const mp4 = m.video_info.variants.filter(v => /mp4/.test(v.content_type || v.type || '') || /\.mp4/.test(v.url || ''))
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        if (mp4[0]) out.push({ url: mp4[0].url, ext: 'mp4' });
+      } else if (m.media_url_https) {
+        const ext = ((m.media_url_https.match(/\.(\w+)$/) || [])[1] || 'jpg').toLowerCase();
+        out.push({ url: m.media_url_https.replace(/\.\w+$/, '') + '?format=' + ext + '&name=orig', ext });
+      }
+    });
+    return out;
+  }
+  function walkX(o, depth) {
+    if (!o || typeof o !== 'object' || depth > 40) return;
+    const leg = o.legacy;
+    if (o.rest_id && leg && (leg.extended_entities || leg.entities)) {
+      const media = (leg.extended_entities && leg.extended_entities.media) || (leg.entities && leg.entities.media) || [];
+      if (media.length) {
+        const ur = o.core && o.core.user_results && o.core.user_results.result;
+        const user = ur && ((ur.legacy && ur.legacy.screen_name) || (ur.core && ur.core.screen_name));
+        const list = xMediaList(media);
+        if (list.length) xTweets[o.rest_id] = { id: o.rest_id, user: user || 'unknown', time: Date.parse(leg.created_at) / 1000 || null, media: list };
+      }
+    }
+    for (const k in o) walkX(o[k], depth + 1);
+  }
+
+  function scanEmbedded() {
+    try {
+      if (PLATFORM === 'instagram') {
+        document.querySelectorAll('script[type="application/json"]').forEach(s => {
+          const t = s.textContent;
+          if (t && /video_versions|image_versions2/.test(t)) { try { walkIG(JSON.parse(t), null, 0); } catch (e) {} }
+        });
+      } else if (PLATFORM === 'tiktok') {
+        ['__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE'].forEach(id => {
+          const s = document.getElementById(id);
+          if (s) { try { walkTT(JSON.parse(s.textContent), 0); } catch (e) {} }
+        });
+      } else if (PLATFORM === 'facebook') {
+        fbScanEmbedded();
+      }
+    } catch (e) {}
+  }
+
+  function capture(text) {
+    try {
+      if (PLATFORM === 'instagram') {
+        if (/video_versions|image_versions2/.test(text)) parseLoose(text).forEach(j => walkIG(j, null, 0));
+      } else if (PLATFORM === 'facebook') {
+        if (/playable_url|browser_native|unified_stories|story_bucket/.test(text)) {
+          parseLoose(text).forEach(j => fbDocs.push(j));
+          while (fbDocs.length > 80) fbDocs.shift();
+        }
+      } else if (PLATFORM === 'tiktok') {
+        if (/playAddr|bitrateInfo/.test(text)) parseLoose(text).forEach(j => walkTT(j, 0));
+      } else if (PLATFORM === 'x') {
+        if (/extended_entities|media_url_https/.test(text)) parseLoose(text).forEach(j => walkX(j, 0));
+      }
+    } catch (e) {}
+  }
+
+  if (HAS_HOOKS) {
+    const origFetch = W.fetch;
+    W.fetch = function (input, init) {
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const body = bodyToText(init && init.body);
+        if (PLATFORM === 'facebook' && (SEEN_RE.test(url) || SEEN_RE.test(body))) noteSeen(body);
+        if (shouldBlock(url, body)) {
+          return Promise.resolve(new W.Response(JSON.stringify({ status: 'ok', data: {} }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          }));
+        }
+        const p = origFetch.apply(this, arguments);
+        p.then(r => r.clone().text().then(capture).catch(() => {})).catch(() => {});
+        return p;
+      } catch (e) { return origFetch.apply(this, arguments); }
+    };
+    const XHR = W.XMLHttpRequest.prototype;
+    const origOpen = XHR.open, origSend = XHR.send;
+    XHR.open = function (m, url) { this.__stkUrl = String(url || ''); return origOpen.apply(this, arguments); };
+    XHR.send = function (body) {
+      try {
+        if (PLATFORM === 'facebook') { const bt = bodyToText(body); if (SEEN_RE.test(this.__stkUrl) || SEEN_RE.test(bt)) noteSeen(bt); }
+        if (shouldBlock(this.__stkUrl, bodyToText(body))) {
+          origOpen.call(this, 'GET', 'data:application/json,%7B%22status%22%3A%22ok%22%7D');
+          return origSend.call(this);
+        }
+        this.addEventListener('load', () => {
+          try { if (this.responseType === '' || this.responseType === 'text') capture(this.responseText); } catch (e) {}
+        });
+      } catch (e) {}
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 3) DOWNLOADERS   (name: username-date-platform.ext)
+   * ------------------------------------------------------------------ */
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const clean = (s) => String(s || 'unknown').replace(/[\\/:*?"<>|\s]+/g, '_').replace(/^_+|_+$/g, '') || 'unknown';
+  const dateOf = (sec) => fmtDate(sec ? new Date(sec * 1000) : new Date());
+  const baseName = (item, suffix) => `${clean(item.username)}-${dateOf(item.takenAt)}-${PLATFORM}${suffix || ''}`;
+
+  // the media that is actually on screen right now (what sits at the centre of the window)
+  function currentMedia() {
+    let stack = [];
+    try { stack = document.elementsFromPoint(innerWidth / 2, innerHeight / 2); } catch (e) {}
+    for (const el of stack) {
+      if (el.tagName === 'VIDEO' && el.offsetWidth > 100) return el;
+      if (el.tagName === 'IMG' && el.naturalWidth > 300 && el.offsetWidth > 100) return el;
+    }
+    let best = null, bestA = 0;
+    document.querySelectorAll('video, img').forEach((el) => {
+      if (el.tagName === 'IMG' && el.naturalWidth <= 300) return;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none' || +cs.opacity < 0.05) return;
+      const r = el.getBoundingClientRect();
+      const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+      const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+      let a = w * h;
+      if (el.tagName === 'VIDEO' && !el.paused) a *= 1.5;
+      if (a > bestA) { best = el; bestA = a; }
+    });
+    return best;
+  }
+  function visibleVideo() {
+    const m = currentMedia();
+    return m && m.tagName === 'VIDEO' ? m : null;
+  }
+  function biggestVisibleImage() {
+    const m = currentMedia();
+    const src = m && m.tagName === 'IMG' ? (m.currentSrc || m.src) : null;
+    return src && /^https?:/.test(src) ? src : null;
+  }
+  function gmGet(url) {
+    return new Promise((res, rej) => GM_xmlhttpRequest({ method: 'GET', url, onload: res, onerror: rej, ontimeout: rej }));
+  }
+
+  /* ---- Instagram ---- */
+  async function igApi(path) {
+    const r = await nativeFetch(path, {
+      credentials: 'include',
+      headers: { 'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    return r.json();
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  async function igLoadFromApi(user, id) {
+    try {
+      let reelId = null;
+      if (user === 'highlights') reelId = 'highlight:' + id;
+      else {
+        reelId = igUserIds[user];
+        if (!reelId) {
+          try {
+            const info = await igApi('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(user));
+            reelId = info && info.data && info.data.user && info.data.user.id;
+          } catch (e) {}
+        }
+        if (!reelId) {
+          try {
+            const info2 = await igApi('/api/v1/users/' + encodeURIComponent(user) + '/usernameinfo/');
+            reelId = info2 && info2.user && (info2.user.pk || info2.user.id);
+          } catch (e) {}
+        }
+      }
+      if (!reelId) return;
+      if (user !== 'highlights') igUserIds[user] = String(reelId);
+      try { walkIG(await igApi('/api/v1/feed/reels_media/?reel_ids=' + encodeURIComponent(reelId)), user === 'highlights' ? null : user, 0); } catch (e) {}
+      if (user !== 'highlights') {
+        try { walkIG(await igApi('/api/v1/feed/user/' + encodeURIComponent(reelId) + '/story/'), user, 0); } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  async function resolveInstagram() {
+    const m = location.pathname.match(/^\/stories\/([^/]+)(?:\/(\d+))?/);
+    if (!m) return null;
+    const user = m[1], id = m[2] || null;
+    const media = currentMedia();
+    const mediaPath = media && media.tagName === 'IMG' ? pathOf(media.currentSrc || media.src) : null;
+    const pool = () => (user === 'highlights' ? Object.values(igStories) : (igByUser[user] || []).map(pk => igStories[pk])).filter(Boolean);
+    const pick = () => (id && igStories[id]) || (mediaPath && pool().find(s => pathOf(s.url) === mediaPath)) || null;
+    let item = pick();
+    if (!item) { scanEmbedded(); item = pick(); }
+    if (!item) { await igLoadFromApi(user, id); item = pick(); }
+    if (!item) { await sleep(800); await igLoadFromApi(user, id); item = pick(); }
+    if (!item && !id && pool().length === 1) item = pool()[0];
+    if (item) return { ...item, ext: item.isVideo ? 'mp4' : 'jpg' };
+    const v = visibleVideo();
+    if (v && v.currentSrc && !v.currentSrc.startsWith('blob:')) return { username: user === 'highlights' ? 'unknown' : user, url: v.currentSrc, ext: 'mp4' };
+    const img = biggestVisibleImage();
+    return img ? { username: user === 'highlights' ? 'unknown' : user, url: img, ext: 'jpg' } : null;
+  }
+  async function resolveInstagramAll() {
+    const m = location.pathname.match(/^\/stories\/([^/]+)(?:\/(\d+))?/);
+    if (!m) return [];
+    const user = m[1];
+    scanEmbedded();
+    await igLoadFromApi(user, m[2] || null);
+    const list = user === 'highlights'
+      ? Object.values(igStories)
+      : (igByUser[user] || []).map(pk => igStories[pk]).filter(Boolean);
+    return list.sort((a, b) => (a.takenAt || 0) - (b.takenAt || 0)).map(s => ({ ...s, ext: s.isVideo ? 'mp4' : 'jpg' }));
+  }
+
+  /* ---- Instagram posts ---- */
+  function shortcodeToId(code) {
+    const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    let id = BigInt(0);
+    for (const ch of code) id = id * BigInt(64) + BigInt(A.indexOf(ch));
+    return id.toString();
+  }
+  async function resolveIGPost(scope) {
+    let code = null;
+    const links = [...scope.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]')];
+    for (const a of links) {
+      const mm = (a.getAttribute('href') || '').match(/\/(?:p|reel|reels)\/([\w-]+)/);
+      if (mm) { code = mm[1]; break; }
+    }
+    if (!code) { const mm = location.pathname.match(/\/(?:p|reel|reels)\/([\w-]+)/); if (mm) code = mm[1]; }
+    if (!code) return null;
+    if (!igPosts[code]) scanEmbedded();
+    if (!igPosts[code]) {
+      try { walkIG(await igApi('/api/v1/media/' + shortcodeToId(code) + '/info/'), null, 0); } catch (e) {}
+    }
+    return igPosts[code] || null;
+  }
+  async function downloadIGPost(btn) {
+    btn.style.opacity = '.5';
+    try {
+      const post = await resolveIGPost(btn.closest('article') || document);
+      if (!post) { toast('Could not find this post\u2019s media. Scroll a little and try again.'); return; }
+      const n = post.items.length;
+      post.items.forEach((it, i) => {
+        setTimeout(() => saveFile({ username: post.username, takenAt: post.takenAt, url: it.url, ext: it.ext }, n > 1 ? '-' + (i + 1) : ''), i * 700);
+      });
+      if (n > 1) toast(`Downloading ${n} files\u2026`);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+
+  /* ---- Facebook ---- */
+  const fbSeenScripts = new WeakSet();
+  const fbSeen = [];   // ids Facebook reported as "story viewed", newest last
+
+  function fbScanEmbedded() {
+    try {
+      document.querySelectorAll('script[type="application/json"]').forEach((sc) => {
+        if (fbSeenScripts.has(sc)) return;
+        fbSeenScripts.add(sc);
+        const t = sc.textContent;
+        if (!t || !/playable_url|browser_native|unified_stories|story_bucket/.test(t)) return;
+        try { fbDocs.push(JSON.parse(t)); } catch (e) {}
+      });
+      while (fbDocs.length > 80) fbDocs.shift();
+    } catch (e) {}
+  }
+  function noteSeen(bodyText) {
+    try {
+      let txt = String(bodyText || '');
+      try { txt = decodeURIComponent(txt.replace(/\+/g, ' ')); } catch (e) {}
+      const ids = [];
+      let m;
+      const re = /"(?:story_id|card_id|story_card_id|story_thread_id|id)"\s*:\s*"([^"]{6,})"/g;
+      while ((m = re.exec(txt))) ids.push(m[1]);
+      const re2 = /"(?:story_ids|card_ids|story_card_ids)"\s*:\s*\[([^\]]*)\]/g;
+      while ((m = re2.exec(txt))) m[1].replace(/"([^"]+)"/g, (all, x) => { ids.push(x); return all; });
+      if (ids.length) { fbSeen.push({ ids, t: Date.now() }); if (fbSeen.length > 30) fbSeen.shift(); }
+    } catch (e) {}
+  }
+  function fbIdSet(seg) {
+    const set = new Set([seg]);
+    try { set.add(decodeURIComponent(seg)); } catch (e) {}
+    try { const d = atob(seg); set.add(d); const n = d.split(':').pop(); if (n) set.add(n); } catch (e) {}
+    return set;
+  }
+  function fbMatches(o, set) {
+    for (const k of ['id', 'story_id', 'legacy_story_id', 'post_id', 'card_id']) {
+      if (o[k] == null) continue;
+      const v = String(o[k]);
+      if (set.has(v)) return true;
+      try { const d = atob(v); if (set.has(d) || set.has(d.split(':').pop())) return true; } catch (e) {}
+    }
+    return false;
+  }
+  const FB_VIDEO_KEYS = ['browser_native_hd_url', 'playable_url_quality_hd', 'browser_native_sd_url', 'playable_url'];
+  function fbCollect(o, acc, depth) {
+    if (!o || typeof o !== 'object' || depth > 30) return;
+    for (const k of FB_VIDEO_KEYS) {
+      if (typeof o[k] === 'string') acc.videos.push({ url: o[k], hd: /hd/.test(k) });
+    }
+    if (typeof o.uri === 'string' && /^https:/.test(o.uri) && o.width && o.height) acc.images.push({ url: o.uri, px: o.width * o.height });
+    if (o.creation_time && !acc.time) acc.time = Number(o.creation_time);
+    if (typeof o.playable_duration_in_ms === 'number' && acc.dur == null) acc.dur = o.playable_duration_in_ms / 1000;
+    if (typeof o.dash_manifest === 'string' && acc.dur == null) {
+      const m = o.dash_manifest.match(/mediaPresentationDuration="PT(?:(\d+)H)?(?:(\d+)M)?([\d.]+)S"/);
+      if (m) acc.dur = (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + parseFloat(m[3]);
+    }
+    for (const k in o) fbCollect(o[k], acc, depth + 1);
+  }
+  const fbRefOf = (o) => {
+    const r = {};
+    let any = false;
+    for (const k of ['id', 'story_id', 'legacy_story_id', 'post_id', 'card_id']) if (o[k] != null) { r[k] = o[k]; any = true; }
+    return any ? r : null;
+  };
+  const fbIsStoryNode = (o) => o.id != null && (o.creation_time != null || o.attachments != null || o.story_card_info != null || o.story_card_seen_state != null);
+  const fbHasOwnVideo = (o) => FB_VIDEO_KEYS.some(k => typeof o[k] === 'string');
+
+  // every story we have data for: {id, refs, chain, acc:{videos,images,time,dur}, owner, ownerId}
+  function fbEntries() {
+    function collect(loose) {
+      const entries = [], stack = [];
+      function walk(o, owner, ownerId, depth) {
+        if (!o || typeof o !== 'object' || depth > 70) return 0;
+        let ow = owner, oid = ownerId;
+        const so = o.story_bucket_owner;
+        if (so && typeof so === 'object') { if (typeof so.name === 'string') ow = so.name; if (so.id != null) oid = String(so.id); }
+        stack.push(o);
+        let found = 0;
+        for (const k in o) found += walk(o[k], ow, oid, depth + 1);
+        if (!found && (fbIsStoryNode(o) || (loose && fbHasOwnVideo(o)))) {
+          const acc = { videos: [], images: [], time: null, dur: null };
+          fbCollect(o, acc, 0);
+          if (acc.videos.length || acc.images.length) {
+            entries.push({ id: String(o.id != null ? o.id : 'x' + entries.length), refs: stack.map(fbRefOf).filter(Boolean), chain: stack.slice(), acc, owner: ow, ownerId: oid });
+            found = 1;
+          }
+        }
+        stack.pop();
+        return found;
+      }
+      for (let i = fbDocs.length - 1; i >= 0; i--) walk(fbDocs[i], null, null, 0);
+      return entries;
+    }
+    const e1 = collect(false);
+    return e1.length ? e1 : collect(true);
+  }
+  const fbRefMatch = (e, set) => e.refs.some(r => fbMatches(r, set));
+  function fbSeenSet() {
+    const set = new Set();
+    if (fbSeen.length) fbSeen[fbSeen.length - 1].ids.forEach(id => fbIdSet(id).forEach(v => set.add(v)));
+    return set;
+  }
+  // all stories of the same person as `entry`, oldest first
+  function fbGroup(entry, entries) {
+    let group = [entry];
+    if (entry.ownerId) group = entries.filter(e => e.ownerId === entry.ownerId);
+    else {
+      for (let i = entry.chain.length - 2; i >= 0; i--) {
+        const anc = entry.chain[i];
+        const mem = entries.filter(e => e.chain.includes(anc));
+        if (mem.length >= 2) { group = mem; break; }
+      }
+    }
+    const byId = new Map();
+    group.forEach((e) => { const old = byId.get(e.id); if (!old || (!old.acc.videos.length && e.acc.videos.length)) byId.set(e.id, e); });
+    return [...byId.values()].sort((a, b) => (a.acc.time || 0) - (b.acc.time || 0));
+  }
+  // the first entry that tells us which person / story is on screen
+  function fbFindRef(entries, mediaSrc, bucket, set) {
+    const p = mediaSrc && /^https?:/.test(mediaSrc) ? pathOf(mediaSrc) : null;
+    if (p) {
+      const e = entries.find(x => x.acc.videos.some(v => pathOf(v.url) === p) || x.acc.images.some(i => pathOf(i.url) === p));
+      if (e) return { entry: e, exact: true };
+    }
+    const seen = fbSeenSet();
+    if (seen.size) { const e = entries.find(x => fbRefMatch(x, seen)); if (e) return { entry: e }; }
+    if (set && set.size) { const e = entries.find(x => fbRefMatch(x, set)); if (e) return { entry: e }; }
+    if (bucket) {
+      const b = fbIdSet(bucket);
+      const e = entries.find(x => (x.ownerId && b.has(x.ownerId)) || fbRefMatch(x, b));
+      if (e) return { entry: e };
+    }
+    return null;
+  }
+  // which story of the group is playing right now
+  function fbPick(group, card, media, set) {
+    const isVid = media && media.tagName === 'VIDEO';
+    const ok = (e) => isVid ? e.acc.videos.length > 0 : true;
+    const pool = group.filter(ok);
+    if (!pool.length) return null;
+    const bars = card ? fbBars(card) : null;
+    if (bars && group.length === bars.n) { const e = group[bars.active]; if (e && ok(e)) return e; }
+    if (isVid && isFinite(media.duration)) {
+      const near = pool.filter(e => e.acc.dur != null && Math.abs(e.acc.dur - media.duration) < 0.8);
+      if (near.length === 1) return near[0];
+    }
+    const seen = fbSeenSet();
+    if (seen.size) { const e = pool.find(x => fbRefMatch(x, seen)); if (e) return e; }
+    if (set && set.size) { const e = pool.find(x => fbRefMatch(x, set)); if (e) return e; }
+    return pool.length === 1 ? pool[0] : null;
+  }
+  function fbItemFrom(acc, name) {
+    let url, ext;
+    if (acc.videos.length) { const v = acc.videos.find(x => x.hd) || acc.videos[0]; url = v.url; ext = 'mp4'; }
+    else { url = acc.images.slice().sort((x, y) => y.px - x.px)[0].url; ext = 'jpg'; }
+    return { username: name, takenAt: acc.time, url, ext };
+  }
+
+  /* ---- TikTok ---- */
+  async function ttLoadPage(user, id) {
+    try {
+      const r = await nativeFetch(`https://www.tiktok.com/@${user || 'tiktok'}/video/${id}`, { credentials: 'include' });
+      const html = await r.text();
+      const m = html.match(/<script id="(?:__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE)"[^>]*>([\s\S]*?)<\/script>/);
+      if (m) walkTT(JSON.parse(m[1]), 0);
+    } catch (e) {}
+  }
+  async function resolveTikTok(btn) {
+    let container = null, id = null, user = null, c = btn;
+    for (let i = 0; i < 16 && c && c.parentElement; i++) {
+      c = c.parentElement;
+      if (!container && c.querySelector('video')) container = c;
+      if (!id) {
+        const w = c.querySelector('[id^="xgwrapper-"]');
+        const wm = w && w.id.match(/(\d{15,})$/);
+        if (wm) id = wm[1];
+      }
+      if (!id || !user) {
+        const a = c.querySelector('a[href*="/video/"]');
+        const mm = a && a.href.match(/\/@([^/]+)\/video\/(\d+)/);
+        if (mm) { user = user || mm[1]; id = id || mm[2]; }
+      }
+      if (id && container) break;
+    }
+    if (!id) {
+      const mm = location.pathname.match(/\/@([^/]+)\/video\/(\d+)/);
+      if (mm) { user = user || mm[1]; id = mm[2]; }
+    }
+    if (!user && container) {
+      const a = container.querySelector('[data-e2e="video-author-uniqueid"], [data-e2e="browse-username"]');
+      const l = container.querySelector('a[href^="/@"]');
+      user = (a && a.textContent.trim()) || (l && l.getAttribute('href').split('/')[1].replace('@', '')) || null;
+    }
+    scanEmbedded();
+    let item = id && ttItems[id];
+    if (!item && id) { await ttLoadPage(user, id); item = ttItems[id]; }
+    const v = (container && container.querySelector('video')) || visibleVideo();
+    const src = v && (v.currentSrc || v.src);
+    if (!item && src && !src.startsWith('blob:')) {
+      const path = pathOf(src);
+      item = Object.values(ttItems).find(it => it.base.includes(path));
+    }
+    if (item) return { username: item.user, takenAt: item.createTime, url: item.url, ext: 'mp4', referer: 'https://www.tiktok.com/' };
+    if (src && !src.startsWith('blob:')) return { username: user || 'unknown', url: src, ext: 'mp4', referer: 'https://www.tiktok.com/' };
+    return null;
+  }
+
+  /* ---- X ---- */
+  async function xSyndication(id) {
+    try {
+      const token = ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+      const r = await gmGet(`https://cdn.syndication.twimg.com/tweet-result?id=${id}&token=${token}&lang=en`);
+      const d = JSON.parse(r.responseText);
+      const list = xMediaList(d.mediaDetails || []);
+      if (list.length) {
+        xTweets[id] = { id, user: (d.user && d.user.screen_name) || 'unknown', time: Date.parse(d.created_at) / 1000 || null, media: list };
+      }
+    } catch (e) {}
+  }
+  async function resolveX(article) {
+    let id = null, user = null;
+    const link = [...article.querySelectorAll('a[href*="/status/"]')].find(a => a.querySelector('time'));
+    const m = link && link.getAttribute('href').match(/^\/([^/]+)\/status\/(\d+)/);
+    if (m) { user = m[1]; id = m[2]; }
+    if (!id) { const pm = location.pathname.match(/^\/([^/]+)\/status\/(\d+)/); if (pm) { user = pm[1]; id = pm[2]; } }
+    if (!id) return null;
+    if (!xTweets[id]) await xSyndication(id);
+    const t = xTweets[id];
+    if (!t || !t.media.length) return null;
+    return t;
+  }
+  async function downloadX(btn, article) {
+    btn.style.opacity = '.5';
+    try {
+      const t = await resolveX(article);
+      if (!t) { toast('No downloadable media found in this post.'); return; }
+      const n = t.media.length;
+      t.media.forEach((mm, i) => {
+        setTimeout(() => saveFile({ username: t.user, takenAt: t.time, url: mm.url, ext: mm.ext }, n > 1 ? '-' + (i + 1) : ''), i * 700);
+      });
+      if (n > 1) toast(`Downloading ${n} files\u2026`);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+
+  /* ---- saving ---- */
+  function triggerSave(blob, name) {
+    const a = document.createElement('a');
+    const u = URL.createObjectURL(blob);
+    a.href = u; a.download = name; a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(u); }, 5000);
+  }
+  function saveFile(item, suffix) {
+    const name = `${baseName(item, suffix)}.${item.ext || 'mp4'}`;
+    const viaGM = () => GM_download({
+      url: item.url, name, saveAs: false, conflictAction: 'uniquify',
+      headers: item.referer ? { Referer: item.referer } : undefined,
+      onload: () => toast('Saved: ' + name),
+      onerror: (e) => toast('Download failed: ' + ((e && (e.error || e.details)) || 'unknown error')),
+    });
+    try {
+      GM_xmlhttpRequest({
+        method: 'GET', url: item.url, responseType: 'blob',
+        headers: item.referer ? { Referer: item.referer } : {},
+        onload: (r) => {
+          if (r.status >= 200 && r.status < 300 && r.response) { triggerSave(r.response, name); toast('Saved: ' + name); }
+          else { toast('Direct fetch failed (HTTP ' + r.status + '), trying fallback\u2026'); viaGM(); }
+        },
+        onerror: viaGM, ontimeout: viaGM,
+      });
+    } catch (e) { viaGM(); }
+  }
+  function saveMany(items) {
+    const n = items.length;
+    items.forEach((it, i) => setTimeout(() => saveFile(it, n > 1 ? '-' + (i + 1) : ''), i * 900));
+    toast(n > 1 ? `Downloading ${n} stories\u2026` : 'Downloading\u2026');
+  }
+
+  async function downloadIGStory(btn) {
+    btn.style.opacity = '.5';
+    try {
+      const item = await resolveInstagram();
+      if (!item || !item.url) { toast('Could not find this story\u2019s media. Let it play for a moment, or use the second button (all stories).'); return; }
+      saveFile(item);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+  async function downloadIGAll(btn) {
+    btn.style.opacity = '.5';
+    try {
+      const items = await resolveInstagramAll();
+      if (!items.length) { toast('No stories found yet. Let the first story load, then try again.'); return; }
+      saveMany(items);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+
+  async function downloadTikTok(btn) {
+    const setLab = (t) => { if (btn._label) btn._label.textContent = t; };
+    setLab('\u2026');
+    try {
+      const item = await resolveTikTok(btn);
+      if (!item) { toast('Could not find this video. Let it play for a moment and try again.'); return; }
+      saveFile(item);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { setLab('Save'); }
+  }
+
+  /* ---- injected buttons (cloned from the site's own buttons) ---- */
+  function dlSvg(color, cls) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('width', '24'); svg.setAttribute('height', '24');
+    if (cls) svg.setAttribute('class', cls);
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M11 3h2v9.17l3.59-3.58L18 10l-6 6-6-6 1.41-1.41L11 12.17V3zM5 19h14v2H5z');
+    path.setAttribute('fill', color || 'currentColor');
+    svg.appendChild(path);
+    return svg;
+  }
+  function stripClone(b) {
+    b.removeAttribute('data-e2e'); b.removeAttribute('id'); b.removeAttribute('data-testid');
+    if (b.hasAttribute('aria-label')) b.setAttribute('aria-label', 'Download (G+)');
+    b.querySelectorAll('[data-e2e]').forEach(n => n.removeAttribute('data-e2e'));
+    b.querySelectorAll('[data-testid]').forEach(n => n.removeAttribute('data-testid'));
+    b.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+    b.querySelectorAll('[aria-label]').forEach(n => n.setAttribute('aria-label', 'Download (G+)'));
+    b.querySelectorAll('[aria-pressed]').forEach(n => n.removeAttribute('aria-pressed'));
+    b.style.removeProperty('display');
+  }
+  function swallow(b, onClick) {
+    const handler = (ev) => { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); if (ev.type === 'click') onClick(); };
+    ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup'].forEach(t => b.addEventListener(t, handler, true));
+    b.style.cursor = 'pointer';
+  }
+
+  function makeTikTokButton(item, bar) {
+    const b = item.cloneNode(true);
+    stripClone(b);
+    b.classList.add('stk-ttdl');
+    b.title = 'Download video (G+)';
+    let color = 'currentColor';
+    const ref = bar.querySelector('[data-e2e="comment-icon"] svg, [data-e2e="browse-comment-icon"] svg');
+    if (ref) { try { color = getComputedStyle(ref).fill || color; } catch (e) {} }
+    const oldSvg = b.querySelector('svg');
+    if (oldSvg) oldSvg.replaceWith(dlSvg(color)); else b.insertBefore(dlSvg(color), b.firstChild);
+    let lab = b.querySelector('strong');
+    if (!lab) {
+      const leaves = [...b.querySelectorAll('span, div, p')].filter(n => !n.childElementCount && n.textContent.trim());
+      lab = leaves[leaves.length - 1] || null;
+    }
+    if (lab) lab.textContent = 'Save';
+    b._label = lab;
+    swallow(b, () => downloadTikTok(b));
+    return b;
+  }
+  function ensureTikTokButtons() {
+    if (PLATFORM !== 'tiktok') return;
+    if (!cfg.download) { document.querySelectorAll('.stk-ttdl').forEach(b => b.remove()); return; }
+    document.querySelectorAll('[data-e2e="like-icon"], [data-e2e="browse-like-icon"]').forEach((icon) => {
+      const item = climbTo(icon, TT_C) || icon.closest('button');
+      if (!item || !item.parentElement) return;
+      const bar = item.parentElement;
+      const prev = item.previousElementSibling;
+      if (prev && prev.classList.contains('stk-ttdl')) return;
+      bar.insertBefore(makeTikTokButton(item, bar), item);
+    });
+  }
+
+  function makeXButton(group, article) {
+    const tpl = group.firstElementChild;
+    const b = tpl.cloneNode(true);
+    stripClone(b);
+    b.classList.add('stk-xdl');
+    b.title = 'Download photos / videos (G+)';
+    let color = '';
+    const refSvg = tpl.querySelector('svg');
+    if (refSvg) { try { color = getComputedStyle(refSvg).color; } catch (e) {} }
+    const ico = document.createElement('span');
+    ico.className = 'stk-xdl-ico';
+    if (color) ico.style.color = color;
+    const svg = dlSvg('currentColor');
+    svg.setAttribute('width', '18.75'); svg.setAttribute('height', '18.75');
+    ico.appendChild(svg);
+    const btn = b.matches('[role="button"]') ? b : (b.querySelector('[role="button"]') || b);
+    while (btn.firstChild) btn.removeChild(btn.firstChild);
+    btn.appendChild(ico);
+    swallow(b, () => downloadX(b, article));
+    return b;
+  }
+  function dlSvgOutline(cls) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('width', '24'); svg.setAttribute('height', '24');
+    svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2'); svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('role', 'img');
+    if (cls) svg.setAttribute('class', cls);
+    [['path', { d: 'M12 4v11' }], ['polyline', { points: '7 11 12 16 17 11' }], ['path', { d: 'M5 20h14' }]].forEach(([tag, attrs]) => {
+      const n = document.createElementNS(NS, tag);
+      for (const k in attrs) n.setAttribute(k, attrs[k]);
+      svg.appendChild(n);
+    });
+    return svg;
+  }
+  function makeIGButton(item) {
+    const b = item.cloneNode(true);
+    stripClone(b);
+    b.querySelectorAll('span').forEach(sp => { if (!sp.childElementCount && NUM_RE.test(sp.textContent.trim())) sp.textContent = ''; });
+    b.classList.add('stk-igdl');
+    b.title = 'Download photos / videos (G+)';
+    const old = b.querySelector('svg');
+    const cls = old && old.getAttribute('class');
+    const fresh = dlSvgOutline(cls);
+    if (old) old.replaceWith(fresh); else b.appendChild(fresh);
+    swallow(b, () => downloadIGPost(b));
+    return b;
+  }
+  function ensureIGPostButtons() {
+    if (PLATFORM !== 'instagram') return;
+    if (!cfg.postdl) { document.querySelectorAll('.stk-igdl').forEach(b => b.remove()); return; }
+    document.querySelectorAll(IG_SEND).forEach((svg) => {
+      if (svg.closest('.stk-igdl')) return;
+      const item = igItemOf(svg);
+      const bar = item.parentElement;
+      if (!bar) return;
+      let anc = bar, ok = false;
+      for (let i = 0; i < 4 && anc; i++, anc = anc.parentElement) {
+        if (anc.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"]')) { ok = true; break; }
+      }
+      if (!ok) return;
+      const nx = item.nextElementSibling;
+      if (nx && nx.classList.contains('stk-igdl')) return;
+      bar.insertBefore(makeIGButton(item), item.nextSibling);
+    });
+  }
+  function ensureXButtons() {
+    if (PLATFORM !== 'x') return;
+    if (!cfg.download) { document.querySelectorAll('.stk-xdl').forEach(b => b.remove()); return; }
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+      if (!article.querySelector('[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="videoComponent"], video')) return;
+      const group = article.querySelector('[role="group"]');
+      if (!group || group.querySelector('.stk-xdl') || !group.firstElementChild) return;
+      group.appendChild(makeXButton(group, article));
+    });
+  }
+
+  /* ---- Facebook story viewer helpers (scoped to the story card on screen) ---- */
+  const FB_AGO_RE = /^(\d+)\s*(s|m|min|mins|h|hr|hrs|d|w)$/i;
+  function effVisible(el) {
+    let op = 1;
+    for (let n = el, i = 0; n && i < 14; n = n.parentElement, i++) {
+      const cs = getComputedStyle(n);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      op *= parseFloat(cs.opacity || '1');
+      if (op < 0.2) return false;
+    }
+    return true;
+  }
+  function mediaIn(root) {
+    const cr = root.getBoundingClientRect();
+    const cands = [...root.querySelectorAll('video, img')].filter((el) => {
+      if (el.tagName === 'IMG' && el.naturalWidth <= 300) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 150 || r.height < 150) return false;
+      return effVisible(el);
+    });
+    if (!cands.length) return null;
+    let stack = [];
+    try { stack = document.elementsFromPoint(cr.left + cr.width / 2, cr.top + cr.height / 2); } catch (e) {}
+    for (const el of stack) if (cands.includes(el)) return el;
+    const a = (el) => { const r = el.getBoundingClientRect(); return r.width * r.height; };
+    return cands.sort((x, y) => a(y) - a(x))[0];
+  }
+  function fbCardOf(el) {
+    let n = el;
+    for (let i = 0; i < 16 && n; i++, n = n.parentElement) {
+      const r = n.getBoundingClientRect();
+      if (r.height > 450 && r.width > 250 && r.height > r.width) return n;
+    }
+    return null;
+  }
+  function fbBars(card) {
+    const cr = card.getBoundingClientRect();
+    const segs = [...card.querySelectorAll('div, span')].filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.height > 0 && r.height <= 8 && r.width >= 12 && r.top >= cr.top - 2 && r.top <= cr.top + 36 && r.left >= cr.left - 2 && r.right <= cr.right + 2;
+    });
+    if (!segs.length) return null;
+    const outer = segs.filter(a => !segs.some(b => b !== a && b.contains(a)));
+    let tracks = outer;
+    if (outer.length === 1) {
+      const kids = [...outer[0].children].filter((k) => { const r = k.getBoundingClientRect(); return r.height > 0 && r.height <= 8 && r.width >= 12; });
+      if (kids.length >= 2) tracks = kids;
+    }
+    tracks.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    const ratios = tracks.map((t) => {
+      const tr = t.getBoundingClientRect();
+      let m = 0;
+      t.querySelectorAll('*').forEach((c) => { const w = c.getBoundingClientRect().width; if (w > m) m = w; });
+      return tr.width ? Math.min(1, m / tr.width) : 0;
+    });
+    let active = ratios.findIndex(r => r < 0.98);
+    if (active < 0) active = ratios.length - 1;
+    return { n: tracks.length, active };
+  }
+  function fbCardName(card) {
+    const cr = card.getBoundingClientRect();
+    const out = [];
+    card.querySelectorAll('a[href], h1, h2, h3, h4, strong, span[dir="auto"]').forEach((el) => {
+      const t = (el.textContent || '').trim();
+      if (!t || t.length < 2 || t.length > 45 || /^your story$/i.test(t) || FB_AGO_RE.test(t) || /^(follow|mute|unmute|more|menu|play|pause|send|reply)/i.test(t)) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 10 || r.height < 8) return;
+      if (r.top < cr.top - 5 || r.top > cr.top + 130 || r.left < cr.left - 5 || r.right > cr.right + 5) return;
+      out.push({ t, top: r.top, left: r.left });
+    });
+    out.sort((a, b) => (Math.round(a.top / 6) - Math.round(b.top / 6)) || (a.left - b.left));
+    return out.length ? out[0].t : null;
+  }
+  function fbCardAgo(card) {
+    const cr = card.getBoundingClientRect();
+    for (const el of card.querySelectorAll('a, span, abbr, time')) {
+      if (el.childElementCount) continue;
+      const m = (el.textContent || '').trim().match(FB_AGO_RE);
+      if (!m) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top < cr.top - 5 || r.top > cr.top + 130) continue;
+      const u = m[2].toLowerCase();
+      const mult = u === 's' ? 1 : (u === 'm' || u === 'min' || u === 'mins') ? 60 : (u === 'h' || u === 'hr' || u === 'hrs') ? 3600 : u === 'd' ? 86400 : 604800;
+      return Number(m[1]) * mult;
+    }
+    return null;
+  }
+  function fbContext(card) {
+    fbScanEmbedded();
+    const m = location.pathname.match(/^\/stories\/([^/]+)(?:\/([^/?#]+))?/);
+    const bucket = m ? m[1] : null;
+    const set = m && m[2] ? fbIdSet(m[2]) : new Set();
+    let media = card ? mediaIn(card) : null;
+    if (card && !media) {
+      let up = card.parentElement;
+      for (let i = 0; i < 2 && up && !media; i++, up = up.parentElement) {
+        if (up.getBoundingClientRect().width > innerWidth * 0.8) break;   // never leak into neighbouring cards
+        media = mediaIn(up);
+      }
+    }
+    const name = card ? fbCardName(card) : null;
+    const ago = card ? fbCardAgo(card) : null;
+    return { bucket, set, media, name, guessTime: ago != null ? Math.floor(Date.now() / 1000 - ago) : null };
+  }
+  function resolveFBStory(card) {
+    const c = fbContext(card);
+    if (!c.media) return { none: true };
+    const entries = fbEntries();
+    const src = c.media.currentSrc || c.media.src;
+    const direct = /^https?:/.test(src || '');
+    const isVid = c.media.tagName === 'VIDEO';
+    const nameFor = (owner) => c.name || (owner && !/^your story$/i.test(owner) ? owner : 'fb' + (c.bucket || '0'));
+    const ref = fbFindRef(entries, src, c.bucket, c.set);
+
+    if (ref && ref.exact) {
+      const e = ref.entry;
+      const acc = isVid ? e.acc : Object.assign({}, e.acc, { videos: [] });
+      const it = fbItemFrom(acc, nameFor(e.owner));
+      return { ...it, takenAt: it.takenAt || c.guessTime };
+    }
+    if (direct) return { username: nameFor(null), takenAt: c.guessTime, url: src, ext: isVid ? 'mp4' : 'jpg' };
+    if (!ref) return { failed: 'nodata' };
+    const group = fbGroup(ref.entry, entries);
+    const pick = fbPick(group, card, c.media, c.set);
+    if (!pick) return { failed: 'ident' };
+    const it = fbItemFrom(pick.acc, nameFor(pick.owner));
+    return { ...it, takenAt: it.takenAt || c.guessTime };
+  }
+  function resolveFBAll(card) {
+    const c = fbContext(card);
+    const entries = fbEntries();
+    const src = c.media ? (c.media.currentSrc || c.media.src) : null;
+    const ref = fbFindRef(entries, src, c.bucket, c.set);
+    if (!ref) return { nodata: true, items: [] };
+    const group = fbGroup(ref.entry, entries);
+    const items = group.map((e) => {
+      const it = fbItemFrom(e.acc, c.name || (e.owner && !/^your story$/i.test(e.owner) ? e.owner : 'fb' + (c.bucket || '0')));
+      return { ...it, takenAt: it.takenAt || c.guessTime };
+    });
+    return { items };
+  }
+  async function downloadFBStory(card, btn) {
+    btn.style.opacity = '.5';
+    try {
+      const r = resolveFBStory(card);
+      if (r.none) { toast('This story has no photo or video to save (text-only story).'); return; }
+      if (r.failed === 'nodata') { toast('Story data has not loaded yet. Let it play a few seconds, then try again.'); return; }
+      if (r.failed) { toast('Could not tell which story this is. Use the second button (all stories).'); return; }
+      saveFile(r);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+  async function downloadFBAll(card, btn) {
+    btn.style.opacity = '.5';
+    try {
+      const r = resolveFBAll(card);
+      if (!r.items.length) { toast('No story data yet. Let the story play for a few seconds, then try again.'); return; }
+      saveMany(r.items);
+    } catch (e) { toast('Error: ' + (e && e.message ? e.message : e)); }
+    finally { btn.style.opacity = ''; }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 4) ELEMENT PICKER (fallback: hide anything the sites change)
+   * ------------------------------------------------------------------ */
+  let pickOn = false, hl = null, pickLevel = 0, lastEl = null;
+  const inOurUI = (el) => el && el.closest && el.closest('#stk-root');
+  function pickTarget(el) {
+    let n = el.closest('[data-ad-rendering-role],[data-testid],[data-e2e],[aria-label],[role="button"],button,a') || el;
+    for (let i = 0; i < pickLevel && n.parentElement && n.parentElement !== document.body; i++) n = n.parentElement;
+    return n;
+  }
+  function drawHl() {
+    if (!hl || !lastEl) return;
+    const r = pickTarget(lastEl).getBoundingClientRect();
+    hl.style.left = r.left + 'px'; hl.style.top = r.top + 'px';
+    hl.style.width = r.width + 'px'; hl.style.height = r.height + 'px';
+  }
+  function pmove(e) {
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el || el === hl || inOurUI(el)) return;
+    lastEl = el; drawHl();
+  }
+  function block(e) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); }
+  function pclick(e) {
+    block(e);
+    const n = pickTarget(lastEl || e.target);
+    const rule = makeRule(n);
+    endPick();
+    if (!rule) { toast('Could not build a safe rule for that element. Try again and press \u2191 to select a bigger area.'); return; }
+    customRules.push(rule);
+    GM_setValue('custom_' + PLATFORM, customRules);
+    scan(); apply();
+    toast('Hidden. Use \u201CReset picked\u201D in the G+ panel to undo.');
+  }
+  function pkey(e) {
+    if (e.key === 'Escape') { block(e); endPick(); toast('Cancelled'); }
+    else if (e.key === 'ArrowUp') { block(e); pickLevel++; drawHl(); }
+    else if (e.key === 'ArrowDown') { block(e); pickLevel = Math.max(0, pickLevel - 1); drawHl(); }
+  }
+  function makeRule(n) {
+    for (const a of ['data-ad-rendering-role', 'data-testid', 'data-e2e', 'aria-label']) {
+      const v = n.getAttribute(a);
+      if (v) return { sel: `[${a}="${v.replace(/"/g, '\\"')}"]` };
+    }
+    const tag = n.tagName.toLowerCase(), role = n.getAttribute('role');
+    const t = normText(n.textContent);
+    if (t && t.length <= 30) return { sel: role ? `${tag}[role="${role}"]` : tag, text: t };
+    const cls = [...n.classList].filter(c => c.length < 30 && !/\d{3,}/.test(c)).slice(0, 3);
+    if (!cls.length) return null;
+    return { sel: tag + cls.map(c => '.' + CSS.escape(c)).join('') };
+  }
+  function startPick() {
+    if (pickOn) return;
+    pickOn = true; pickLevel = 0; lastEl = null;
+    panel.style.display = 'none';
+    hl = document.createElement('div');
+    hl.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;border:2px solid #00c2ff;background:rgba(0,194,255,.18);border-radius:6px';
+    document.body.appendChild(hl);
+    document.addEventListener('mousemove', pmove, true);
+    ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup'].forEach(t => document.addEventListener(t, t === 'click' ? pclick : block, true));
+    document.addEventListener('keydown', pkey, true);
+    toast('Click the element to hide.  \u2191 / \u2193 = bigger / smaller area.  Esc = cancel');
+  }
+  function endPick() {
+    pickOn = false;
+    if (hl) { hl.remove(); hl = null; }
+    document.removeEventListener('mousemove', pmove, true);
+    ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup'].forEach(t => document.removeEventListener(t, t === 'click' ? pclick : block, true));
+    document.removeEventListener('keydown', pkey, true);
+  }
+  function resetPicked() {
+    customRules = [];
+    GM_setValue('custom_' + PLATFORM, customRules);
+    marked.forEach(keys => keys.delete('custom'));
+    apply();
+    toast('Picked elements restored.');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 5) UI  (single colour, follows the site's light / dark mode)
+   * ------------------------------------------------------------------ */
+  let root, toastEl, panel, storyStack;
+
+  function toast(msg) {
+    if (!toastEl) return;
+    toastEl.textContent = msg;
+    toastEl.style.opacity = '1';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => (toastEl.style.opacity = '0'), 5000);
+  }
+
+  let themePref = GM_getValue('stk_theme', 'auto');
+  function applyTheme() {
+    if (!root) return;
+    root.dataset.theme = (themePref === 'light' || themePref === 'dark') ? themePref : (siteIsDark() ? 'dark' : 'light');
+  }
+  function siteIsDark() {
+    const lum = (c) => {
+      const m = c && c.match(/rgba?\(([^)]+)\)/);
+      if (!m) return null;
+      const p = m[1].split(',').map(x => parseFloat(x));
+      if (p.length >= 4 && p[3] < 0.15) return null;
+      return (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255;
+    };
+    try {
+      for (const el of document.elementsFromPoint(30, innerHeight - 30)) {
+        if (root && root.contains(el)) continue;
+        for (let n = el; n; n = n.parentElement) {
+          const l = lum(getComputedStyle(n).backgroundColor);
+          if (l != null) return l < 0.5;
+        }
+      }
+    } catch (e) {}
+    for (const el of [document.body, document.documentElement]) {
+      if (!el) continue;
+      const l = lum(getComputedStyle(el).backgroundColor);
+      if (l != null) return l < 0.5;
+    }
+    return matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  function dlSvgAll(color) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('width', '24'); svg.setAttribute('height', '24');
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M11 2h2v7.17l2.59-2.58L17 8l-5 5-5-5 1.41-1.41L11 9.17V2zM5 15h14v2H5zM5 19h14v2H5z');
+    path.setAttribute('fill', color || 'currentColor');
+    svg.appendChild(path);
+    return svg;
+  }
+
+  /* Facebook story viewer: two buttons stacked under the "..." options button */
+  function findFBOptions() {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 8 && r.height > 8 && r.top < innerHeight * 0.45 && r.bottom > 0; };
+    const labelled = [...document.querySelectorAll('[aria-label]')].filter(el => !root.contains(el) && vis(el));
+    const cx = innerWidth / 2;
+    const dist = (el) => { const r = el.getBoundingClientRect(); return Math.abs((r.left + r.right) / 2 - cx); };
+    const opts = labelled.filter(el => /^(menu|more|more options|options|story options|see more options)$/i.test(el.getAttribute('aria-label') || ''));
+    if (opts.length) { const el = opts.sort((a, b) => dist(a) - dist(b))[0]; return el.closest('[role="button"], button') || el; }
+    const ctl = labelled.find(el => /^(un)?mute(d)?$|^(pause|play)$|audio|sound/i.test(el.getAttribute('aria-label') || ''));
+    const card = ctl && fbCardOf(ctl);
+    if (!card) return null;
+    const cr = card.getBoundingClientRect();
+    const btns = [...card.querySelectorAll('[role="button"], button')].filter((b) => {
+      const r = b.getBoundingClientRect();
+      return r.top >= cr.top - 4 && r.top <= cr.top + 110 && r.width > 14 && r.width < 80;
+    });
+    btns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+    return btns[0] || null;
+  }
+  function updateStoryStack() {
+    if (!storyStack) return;
+    const on = cfg.download && /^\/stories\//.test(location.pathname);
+    const opt = on ? findFBOptions() : null;
+    if (!opt) { storyStack.style.display = 'none'; return; }
+    const r = opt.getBoundingClientRect();
+    const size = Math.max(30, Math.round(Math.min(r.width, r.height) || 36));
+    const icon = opt.querySelector('svg, i, img');
+    let glyph = 20;
+    if (icon) { const ir = icon.getBoundingClientRect(); if (ir.width > 8) glyph = Math.round(ir.width); }
+    storyStack._card = fbCardOf(opt);
+    storyStack.style.display = 'flex';
+    storyStack.style.left = Math.round(r.left + r.width / 2 - size / 2) + 'px';
+    storyStack.style.top = Math.round(r.bottom + 4) + 'px';
+    storyStack.querySelectorAll('.stk-fbb').forEach((b) => { b.style.width = size + 'px'; b.style.height = size + 'px'; });
+    storyStack.querySelectorAll('svg').forEach((v) => { v.setAttribute('width', String(glyph)); v.setAttribute('height', String(glyph)); });
+  }
+
+  function buildUI() {
+    GM_addStyle(`
+      #stk-root{--bg:rgba(255,255,255,.9);--bg-solid:#ffffff;--fg:#111113;--muted:rgba(17,17,19,.5);--line:rgba(0,0,0,.12);
+        --hover:rgba(0,0,0,.06);--track:rgba(0,0,0,.18);--knob-off:#ffffff;
+        font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--fg)}
+      #stk-root[data-theme="dark"]{--bg:rgba(24,24,27,.9);--bg-solid:#18181b;--fg:#f4f4f5;--muted:rgba(244,244,245,.5);--line:rgba(255,255,255,.14);
+        --hover:rgba(255,255,255,.08);--track:rgba(255,255,255,.22);--knob-off:#a1a1aa}
+      #stk-hz{position:fixed;left:0;bottom:0;width:68px;height:68px;z-index:2147483647}
+      #stk-gear{position:absolute;left:14px;bottom:14px;width:38px;height:38px;border-radius:13px;padding:0;
+        background:var(--bg);color:var(--fg);border:1px solid var(--line);
+        -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:0 6px 20px rgba(0,0,0,.2);
+        font:700 13.5px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:-.4px;cursor:pointer;
+        display:flex;align-items:center;justify-content:center;
+        opacity:0;transform:translateY(6px) scale(.9);pointer-events:none;
+        transition:opacity .2s ease,transform .2s ease,background .2s ease}
+      #stk-hz:hover #stk-gear,#stk-root.stk-open #stk-gear,#stk-root.stk-peek #stk-gear{opacity:1;transform:none;pointer-events:auto}
+      #stk-gear:hover{background:var(--bg-solid)}
+      #stk-gear:active{transform:scale(.94)}
+      #stk-panel{position:fixed;left:14px;bottom:62px;z-index:2147483647;width:272px;max-height:80vh;overflow:auto;
+        background:var(--bg);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);color:var(--fg);
+        border:1px solid var(--line);border-radius:18px;padding:14px;display:none;
+        box-shadow:0 18px 44px rgba(0,0,0,.28);animation:stkPop .16s ease}
+      @keyframes stkPop{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
+      #stk-panel h4{margin:0 0 4px;font-size:14px;font-weight:700;letter-spacing:.1px;color:var(--fg)}
+      #stk-panel .stk-sec{margin:12px 4px 2px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+      #stk-panel label{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;margin:1px 0;
+        border-radius:10px;cursor:pointer;transition:background .15s}
+      #stk-panel label:hover{background:var(--hover)}
+      #stk-panel input[type=checkbox]{appearance:none;-webkit-appearance:none;flex:none;order:2;width:34px;height:20px;margin:0;
+        border-radius:999px;background:var(--track);position:relative;cursor:pointer;transition:background .2s}
+      #stk-panel input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+        background:var(--knob-off);box-shadow:0 1px 2px rgba(0,0,0,.35);transition:transform .2s cubic-bezier(.3,.9,.4,1.2),background .2s}
+      #stk-panel input[type=checkbox]:checked{background:var(--fg)}
+      #stk-panel input[type=checkbox]:checked::after{transform:translateX(14px);background:var(--bg-solid)}
+      #stk-panel .stk-row{display:flex;gap:8px;margin-top:6px}
+      #stk-panel .stk-btn{flex:1;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:transparent;
+        color:var(--fg);font:600 12px system-ui,sans-serif;cursor:pointer;transition:background .15s}
+      #stk-panel .stk-btn:hover{background:var(--hover)}
+      #stk-panel .stk-seg{display:flex;gap:3px;margin:4px 2px 2px;padding:3px;border:1px solid var(--line);border-radius:11px}
+      #stk-panel .stk-seg button{flex:1;padding:6px 0;border:0;border-radius:8px;background:transparent;color:var(--fg);
+        font:600 12px system-ui,sans-serif;cursor:pointer;transition:background .15s,color .15s}
+      #stk-panel .stk-seg button:hover{background:var(--hover)}
+      #stk-panel .stk-seg button.on{background:var(--fg);color:var(--bg-solid)}
+      #stk-storystack{position:fixed;z-index:2147483647;display:none;flex-direction:column;gap:4px}
+      .stk-fbb{display:flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:50%;background:transparent;color:#fff;
+        cursor:pointer;transition:background .15s ease}
+      .stk-fbb:hover{background:rgba(255,255,255,.2)}
+      .stk-fbb svg{display:block;filter:drop-shadow(0 0 2px rgba(0,0,0,.5))}
+      .stk-ttdl,.stk-xdl,.stk-igdl{cursor:pointer;transition:opacity .15s ease}
+      .stk-ttdl:hover,.stk-igdl:hover{opacity:.7}
+      .stk-ttdl svg,.stk-xdl svg,.stk-igdl svg{display:block}
+      .stk-xdl .stk-xdl-ico{display:flex;align-items:center;justify-content:center;width:34.75px;height:34.75px;border-radius:50%;
+        transition:background-color .2s ease,color .2s ease}
+      .stk-xdl:hover .stk-xdl-ico{background-color:rgba(29,155,240,.1);color:rgb(29,155,240)!important}
+      #stk-toast{position:fixed;left:50%;bottom:32px;transform:translateX(-50%);z-index:2147483647;max-width:80vw;text-align:center;
+        background:var(--bg);color:var(--fg);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+        padding:10px 16px;border-radius:14px;border:1px solid var(--line);
+        opacity:0;transition:opacity .25s;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+    `);
+
+    root = document.createElement('div');
+    root.id = 'stk-root';
+    applyTheme();
+
+    const hz = document.createElement('div');
+    hz.id = 'stk-hz';
+    const gear = document.createElement('button');
+    gear.id = 'stk-gear'; gear.textContent = 'G+'; gear.title = 'G+';
+    hz.appendChild(gear);
+
+    panel = document.createElement('div');
+    panel.id = 'stk-panel';
+    const title = document.createElement('h4');
+    title.textContent = 'G+ \u00b7 ' + ({ instagram: 'Instagram', facebook: 'Facebook', tiktok: 'TikTok', x: 'X' }[PLATFORM] || PLATFORM);
+    panel.appendChild(title);
+
+    const secTh = document.createElement('div');
+    secTh.className = 'stk-sec'; secTh.textContent = 'Theme';
+    panel.appendChild(secTh);
+    const seg = document.createElement('div');
+    seg.className = 'stk-seg';
+    [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].forEach(([v, label]) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; b.dataset.theme = v;
+      if (themePref === v) b.classList.add('on');
+      b.onclick = () => {
+        themePref = v; GM_setValue('stk_theme', v); applyTheme();
+        seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x.dataset.theme === v));
+      };
+      seg.appendChild(b);
+    });
+    panel.appendChild(seg);
+
+    (OPTIONS[PLATFORM] || []).forEach((opt) => {
+      if (opt.section) {
+        const sec = document.createElement('div');
+        sec.className = 'stk-sec'; sec.textContent = opt.section;
+        panel.appendChild(sec);
+        return;
+      }
+      const lab = document.createElement('label');
+      const span = document.createElement('span');
+      span.textContent = opt.label;
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.dataset.k = opt.key; cb.checked = !!cfg[opt.key];
+      lab.appendChild(span); lab.appendChild(cb);
+      panel.appendChild(lab);
+    });
+
+    const secT = document.createElement('div');
+    secT.className = 'stk-sec'; secT.textContent = 'Custom';
+    panel.appendChild(secT);
+    const row = document.createElement('div');
+    row.className = 'stk-row';
+    const pickB = document.createElement('button');
+    pickB.className = 'stk-btn'; pickB.textContent = 'Pick & hide';
+    pickB.onclick = startPick;
+    const resetB = document.createElement('button');
+    resetB.className = 'stk-btn'; resetB.textContent = 'Reset';
+    resetB.onclick = resetPicked;
+    row.append(pickB, resetB);
+    panel.appendChild(row);
+
+    panel.addEventListener('change', (e) => {
+      const k = e.target.dataset && e.target.dataset.k;
+      if (!k) return;
+      cfg[k] = e.target.checked;
+      saveCfg();
+      apply();
+      if (k === 'anon') toast(cfg.anon ? 'Anonymous view ON \u2013 reload the story page' : 'Anonymous view OFF');
+      if (k === 'download' || k === 'postdl') { ensureTikTokButtons(); ensureXButtons(); ensureIGPostButtons(); updateStoryStack(); }
+    });
+
+    const setOpen = (v) => { panel.style.display = v ? 'block' : 'none'; root.classList.toggle('stk-open', v); };
+    gear.onclick = () => setOpen(panel.style.display !== 'block');
+    document.addEventListener('mousedown', (e) => {
+      if (panel.style.display === 'block' && !root.contains(e.target)) setOpen(false);
+    }, true);
+
+    toastEl = document.createElement('div');
+    toastEl.id = 'stk-toast';
+
+    root.append(hz, panel, toastEl);
+
+    if (HAS_STORIES) {
+      storyStack = document.createElement('div');
+      storyStack.id = 'stk-storystack';
+      const one = document.createElement('button');
+      one.className = 'stk-fbb'; one.title = 'Download this story (G+)';
+      one.appendChild(dlSvg('currentColor'));
+      const all = document.createElement('button');
+      all.className = 'stk-fbb'; all.title = 'Download all stories (G+)';
+      all.appendChild(dlSvgAll('currentColor'));
+      if (PLATFORM === 'facebook') {
+        swallow(one, () => downloadFBStory(storyStack._card, one));
+        swallow(all, () => downloadFBAll(storyStack._card, all));
+      } else {
+        swallow(one, () => downloadIGStory(one));
+        swallow(all, () => downloadIGAll(all));
+      }
+      storyStack.append(one, all);
+      root.appendChild(storyStack);
+      setInterval(updateStoryStack, 250);
+    }
+
+    document.body.appendChild(root);
+    root.classList.add('stk-peek');
+    setTimeout(() => root.classList.remove('stk-peek'), 2600);
+
+    setInterval(() => {
+      if (!root.isConnected && document.body) document.body.appendChild(root);
+      applyTheme();
+      root.classList.toggle('stk-open', panel.style.display === 'block');
+    }, 800);
+    schedule();
+  }
+
+  function init() { if (document.body) { buildUI(); schedule(); } }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+
+  GM_registerMenuCommand('Open G+ panel', () => {
+    if (panel) { panel.style.display = 'block'; if (root) root.classList.add('stk-open'); }
+  });
+})();
