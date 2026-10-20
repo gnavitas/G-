@@ -1,4 +1,5 @@
 # G+
+<img width="334" height="483" alt="image" src="https://github.com/user-attachments/assets/3a5a2a7c-a06f-49c5-96b7-e52a46721909" />
 
 A Tampermonkey userscript for Facebook, Instagram, TikTok and X.
 
@@ -34,15 +35,19 @@ Move your mouse to the bottom-left corner of the page. A small **G+** button fad
 - **Pick & hide** lets you click any element on the page and hide it. It's the escape hatch for when a site changes something and a toggle stops working. **Reset** brings everything you picked back.
 
 Where the download buttons end up:
+<img width="1386" height="707" alt="image" src="https://github.com/user-attachments/assets/17e1dbb5-87fd-4cea-b4f0-49e481ee8437" /><img width="1056" height="738" alt="image" src="https://github.com/user-attachments/assets/49e6a095-34e1-4029-adb6-962116e2ddcc" />
 
 - **Instagram and Facebook stories:** two icons under the "..." button in the story viewer. The first saves the story you're on, the second saves all of that person's stories.
 - **Instagram posts:** a download icon right after the paper plane.
+<img width="1302" height="708" alt="image" src="https://github.com/user-attachments/assets/d506fb2b-0fd1-4d4f-b3b5-c5a39b3b7c75" />
 - **TikTok:** a Save button above the like button.
+- <img width="766" height="797" alt="image" src="https://github.com/user-attachments/assets/f9776dd3-fdc3-479a-af82-371488bc489f" />
 - **X:** a download icon at the end of the action row, only on posts that have media.
 
 Files are named `username-date-platform.ext`, like `someone-2026-10-20-instagram.mp4`. When there's more than one file they get `-1`, `-2` and so on.
 
 ## Anonymous story view
+<img width="861" height="832" alt="image" src="https://github.com/user-attachments/assets/4c51ffbe-8653-4e42-9da7-944f04ae5268" />
 
 This works by blocking the request that tells Instagram or Facebook you've seen a story. It's on by default. If you flip it, reload the story page before opening a story, otherwise the old setting is still active.
 
